@@ -5,7 +5,7 @@
 #include <limits>
 namespace {
 std::map<uint32_t,std::vector<uint8_t>> memory;
-WmlApi mock{};int native_batches=0,extra_batches=0,marker_draws=0,pos_fallbacks=0,native_minis=0,extra_minis=0;bool fail_draw=false,pressed=false,mini_pass=false;
+WmlApi mock{};int native_batches=0,extra_batches=0,marker_draws=0,pos_fallbacks=0,native_minis=0,extra_minis=0;bool fail_draw=false,mini_pass=false;
 std::array<unsigned,4> color_state{11,22,33,144};std::string overlay;
 std::vector<std::string> labels;
 uint32_t drawn_bitmap=0;
@@ -24,7 +24,6 @@ uint64_t R(WmlContext* c,int i){return reinterpret_cast<PPCRegister*>(c)[Index(i
 void RS(WmlContext* c,int i,uint64_t v){reinterpret_cast<PPCRegister*>(c)[Index(i)].u64=v;}
 void LogFake(const WmlMod*,const char*){}
 void Overlay(const char* s){overlay=s;}
-int Key(int key){assert(key==VK_F7);bool result=pressed;pressed=false;return result;}
 void NativeColor(WmlContext* c,uint8_t*){for(int i=0;i<4;++i)color_state[i]=unsigned(R(c,i+3));}
 int Call(WmlContext* c,uint32_t fn){
     if(fn==0x827889C4){assert(R(c,3)==0&&R(c,4)==0x9000&&R(c,5)==4&&R(c,8)==4096);RS(c,3,0xA0000000);}
@@ -84,7 +83,7 @@ int main(int argc,char** argv){
     memory[0x83A00000].resize(0x10000);memory[0x839E0000].resize(0x10000);memory[0x82080000].resize(0x10000);
     mock.version=1;mock.size=sizeof(mock);mock.log=LogFake;mock.read_u8=U8;mock.read_u16=U16;mock.read_u32=U32;mock.read_f32=Float;
     mock.write_u8=W8;mock.write_u16=W16;mock.write_u32=W32;mock.write_f32=WF;mock.guest_pointer=Pointer;mock.get_r=R;mock.set_r=RS;
-    mock.call=Call;mock.overlay_text=Overlay;mock.key_pressed=Key;api=&mock;static WmlMod mod{"Collectibles","test"};self=&mod;
+    mock.call=Call;mock.overlay_text=Overlay;api=&mock;static WmlMod mod{"Collectibles","test"};self=&mod;
     original_map=NativeMap;original_batch=NativeBatch;original_minibatch=NativeMini;original_pos=NativePos;original_color=NativeColor;original_bitmap=NativeBitmap;original_action=NativeAction;enabled=true;
     W32(0x90012000,1280);W32(0x90012004,720);WF(0x82FFB4E8,1);WF(0x82FFB4EC,1);
     WF(0x82089770,67);WF(0x827AF11C,.000001f);
