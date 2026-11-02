@@ -14,21 +14,104 @@
 
 namespace {
 const WmlApi* api;const WmlMod* self;
-WmlGuestFunction original_map,original_batch,original_minibatch,original_pos,original_color,original_bitmap;
+WmlGuestFunction original_map,original_batch,original_minibatch,original_pos,original_color,original_bitmap,original_input,original_update,original_action,original_pan;
 std::vector<tracker::Location> locations,missing;
 std::atomic<bool> enabled{false};std::atomic<unsigned> mode{3};
 std::atomic<uint64_t> map_seen{0};
 unsigned cds=0,tags=0;bool cds_ready=false,tags_ready=false;
 uint32_t current_player=0;uint64_t next_snapshot=0;
-thread_local bool map_scope=false,custom_draw=false,drawn=false;
+thread_local bool map_scope=false,custom_draw=false,drawn=false,map_input_scope=false;
 thread_local tracker::Kind marker_kind=tracker::Kind::CD;
 constexpr uint32_t kHead=0x83027018,kFake=0x7EDA0000;
 std::vector<uint8_t> atlas_data;
 bool assets_attempted=false,assets_ready=false;
-std::array<uint32_t,3> asset_bitmaps{};
+std::array<uint32_t,2> asset_bitmaps{};
+struct SelectorState{
+    bool ready=false,focused=false,pointer=false,mouse_down=false,capture_click=false;
+    float left=0,top=0,right=0,bottom=0,cursor_x=.5f,cursor_y=.5f;
+    uint16_t previous=0,claimed=0;
+};
+SelectorState selector;std::mutex selector_mutex;
+constexpr uint16_t kUp=1,kDown=2,kLeft=4,kRight=8,kAccept=0x1000;
 void Log(const std::string& s){api->log(self,s.c_str());}
+void ChangeMode(int direction){
+    constexpr unsigned order[]={3,1,2,0};unsigned index=0;while(index<3&&order[index]!=mode.load())++index;
+    mode=order[(index+(direction>0?1:3))%4];Log("Marker mode "+std::to_string(mode.load()));
+}
+uint16_t SelectInput(uint16_t buttons,bool mouse_down,float dx,float dy){
+    // Closing, changing tabs and backing out always belong to the game.
+    if(buttons&0xA330){
+        selector.previous=buttons;selector.claimed=0;selector.focused=selector.pointer=selector.capture_click=false;selector.mouse_down=mouse_down;return buttons;
+    }
+    const auto pressed=uint16_t(buttons&~selector.previous);selector.previous=buttons;
+    selector.claimed&=buttons;
+    if(dx!=0||dy!=0){
+        selector.pointer=true;selector.cursor_x=std::clamp(selector.cursor_x+dx,0.f,1.f);selector.cursor_y=std::clamp(selector.cursor_y+dy,0.f,1.f);
+        selector.focused=selector.cursor_x>=selector.left&&selector.cursor_x<=selector.right&&selector.cursor_y>=selector.top&&selector.cursor_y<=selector.bottom;
+    }
+    const bool hover=selector.pointer&&selector.cursor_x>=selector.left&&selector.cursor_x<=selector.right&&selector.cursor_y>=selector.top&&selector.cursor_y<=selector.bottom;
+    if(pressed&(kUp|kDown)){selector.focused=(pressed&kUp)!=0;selector.pointer=false;}
+    if(selector.focused){
+        const auto horizontal=pressed&(kLeft|kRight);
+        if(horizontal==kLeft||horizontal==kRight)ChangeMode(horizontal==kRight?1:-1);
+        selector.claimed|=buttons&(kLeft|kRight);
+    }
+    if(mouse_down&&!selector.mouse_down&&hover){
+        selector.focused=true;selector.capture_click=true;
+        ChangeMode(selector.cursor_x<(selector.left+selector.right)*.5f?-1:1);
+    }
+    selector.mouse_down=mouse_down;
+    if(!mouse_down)selector.capture_click=false;
+    return uint16_t(buttons&~(selector.claimed|kUp|kDown|(selector.capture_click?kAccept:0)));
+}
 bool Readable(uint32_t p,size_t n){return p>=0x10000 && uint64_t(p)+n<=UINT32_MAX && WmlHostRangeReadable(reinterpret_cast<uintptr_t>(api->guest_pointer(p)),n);}
 bool SinglePlayer(){return api->read_u8(0x8370E9F6)==0 && api->read_u32(0x8309ABEC)!=0;}
+bool ActiveMap(){return api->read_u32(0x8370DDAC)==26;}
+void ObserveInput(WmlContext* ctx,uint8_t* base){
+    const auto user=uint32_t(api->get_r(ctx,3))&255,state=uint32_t(api->get_r(ctx,5));
+    float dx=0,dy=0;bool focused=false;
+    HWND window=GetForegroundWindow();DWORD process=0;if(window)GetWindowThreadProcessId(window,&process);
+    focused=process==GetCurrentProcessId();
+    if(focused){
+        RECT client{};POINT point{};
+        if(GetClientRect(window,&client)&&GetCursorPos(&point)&&ScreenToClient(window,&point)&&client.right>0&&client.bottom>0){
+            dx=float(point.x-client.right/2)/client.right;dy=float(point.y-client.bottom/2)/client.bottom;
+        }
+    }
+    // The port combines keyboard/mouse and controller input here. Read mouse
+    // motion before it recenters the OS cursor, then handle only this widget.
+    original_input(ctx,base);
+    if((user!=0&&user!=255)||api->get_r(ctx,3)!=0||!Readable(state,16))return;
+    std::lock_guard lock(selector_mutex);const auto buttons=api->read_u16(state+4);
+    if(!focused||!enabled||!SinglePlayer()||!ActiveMap()||!selector.ready||GetTickCount64()-map_seen.load()>100){
+        selector.previous=buttons;selector.claimed=0;selector.focused=selector.pointer=selector.capture_click=false;return;
+    }
+    if(api->read_u8(state+6)||api->read_u8(state+7)){
+        selector.previous=buttons;selector.claimed=0;selector.focused=selector.pointer=selector.capture_click=false;return;
+    }
+    const bool mouse_down=api->key_down(VK_LBUTTON)!=0;
+    SelectInput(buttons,mouse_down,dx,dy);
+    // This hook observes input only. The controller packet, button bits,
+    // triggers and sticks returned by the port are never modified.
+}
+void MapAction(WmlContext* ctx,uint8_t* base){
+    if(map_input_scope){
+        const auto action=uint32_t(api->get_r(ctx,3));bool block=false;
+        {std::lock_guard lock(selector_mutex);block=(selector.focused&&(action==43||action==44))||(selector.capture_click&&action==55);}
+        if(block){api->set_r(ctx,3,0);return;}
+    }
+    original_action(ctx,base);
+}
+void MapPan(WmlContext* ctx,uint8_t* base){
+    bool hover=false;{std::lock_guard lock(selector_mutex);hover=selector.pointer&&selector.focused;}
+    if(map_input_scope&&hover&&!api->key_down('W')&&!api->key_down('A')&&!api->key_down('S')&&!api->key_down('D'))return;
+    original_pan(ctx,base);
+}
+void MapUpdate(WmlContext* ctx,uint8_t* base){
+    const bool previous=map_input_scope;map_input_scope=enabled&&SinglePlayer()&&ActiveMap();
+    try{original_update(ctx,base);}catch(...){map_input_scope=previous;throw;}
+    map_input_scope=previous;
+}
 struct Scratch{
     PPCContext ctx;uint32_t start;std::vector<uint8_t> saved;
     float opacity=1,scale_x=1,scale_y=1,anchor_x=0,anchor_y=0;
@@ -42,7 +125,7 @@ void EnsureAssets(Scratch& s){
     if(assets_attempted||atlas_data.empty())return;assets_attempted=true;
     try{
         const auto bitmap_count=api->read_u32(0x8370DD60),group_count=api->read_u32(0x8370DD5C);
-        if(bitmap_count>1021||group_count>=256)throw std::runtime_error("UI bitmap table full");
+        if(bitmap_count>1022||group_count>=256)throw std::runtime_error("UI bitmap table full");
         // One physical allocation owns both the texture definition and its
         // aligned pixel payload for the lifetime of the game process.
         s.ctx.r3.u64=0;s.ctx.r4.u64=0x9000;s.ctx.r5.u64=4;s.ctx.r6.u64=0;s.ctx.r7.u64=uint64_t(-1);s.ctx.r8.u64=4096;
@@ -64,13 +147,13 @@ void EnsureAssets(Scratch& s){
         const auto texture=s.ctx.r3.u32;
         const auto group=0x82FFAEC8+group_count*8;
         api->write_u32(group,definition+23);api->write_u32(group+4,texture);
-        for(unsigned i=0;i<3;++i){
+        for(unsigned i=0;i<2;++i){
             asset_bitmaps[i]=bitmap_count+i;const auto entry=0x82FF5EC8+asset_bitmaps[i]*20;
-            api->write_u32(entry,group_count);api->write_u32(entry+4,i==0?1:i==1?41:81);api->write_u32(entry+8,1);
-            api->write_u32(entry+12,i==2?32:38);api->write_u32(entry+16,i==2?32:38);
+            api->write_u32(entry,group_count);api->write_u32(entry+4,i==0?1:41);api->write_u32(entry+8,1);
+            api->write_u32(entry+12,38);api->write_u32(entry+16,38);
         }
-        api->write_u32(0x8370DD5C,group_count+1);api->write_u32(0x8370DD60,bitmap_count+3);
-        assets_ready=true;Log("Loaded native-resolution CD, graffiti and F7 textures");
+        api->write_u32(0x8370DD5C,group_count+1);api->write_u32(0x8370DD60,bitmap_count+2);
+        assets_ready=true;Log("Loaded native-resolution CD and graffiti textures");
     }catch(const std::exception& e){Log(std::string("Custom UI textures unavailable; using native marker fallback: ")+e.what());}
 }
 void Snapshot(){
@@ -190,7 +273,7 @@ bool PanelBitmap(Scratch& s,uint32_t bitmap,float x,float y,float w,float h){
     api->write_u32(s.ctx.r1.u32+84,height);api->write_u8(s.ctx.r1.u32+95,0);api->write_u8(s.ctx.r1.u32+103,0);api->write_u32(s.ctx.r1.u32+108,0x82839AA0);
     return api->call(reinterpret_cast<WmlContext*>(&s.ctx),0x8227E450)==0;
 }
-void PanelText(Scratch& s,const std::string& text,float x,float y,float scale,std::array<unsigned,3> color,bool title=false,bool right=false){
+void PanelText(Scratch& s,const std::string& text,float x,float y,float scale,std::array<unsigned,3> color,bool title=false,bool right=false,bool center=false){
     x=s.X(x);y=s.Y(y);scale*=std::min(s.scale_x,s.scale_y);
     auto data=s.Data();auto buffer=data+64;
     for(unsigned i=0;i<128;++i)api->write_u16(buffer+i*2,i<text.size()?uint8_t(text[i]):0);
@@ -201,7 +284,7 @@ void PanelText(Scratch& s,const std::string& text,float x,float y,float scale,st
     const float width=float(api->read_u32(data))*scale,height=float(api->read_u32(data+4))*scale;
     PanelColor(s,color[0],color[1],color[2]);
     for(auto font:{outline,fill}){
-        s.ctx.r3.u64=int32_t(right?x-width:x);s.ctx.r4.u64=int32_t(y-height*.5f);s.ctx.r5.u64=buffer;s.ctx.r6.u64=0;s.ctx.r7.u64=font;s.ctx.r8.u64=0x82839AA0;s.ctx.f1.f64=scale;
+        s.ctx.r3.u64=int32_t(right?x-width:center?x-width*.5f:x);s.ctx.r4.u64=int32_t(y-height*.5f);s.ctx.r5.u64=buffer;s.ctx.r6.u64=0;s.ctx.r7.u64=font;s.ctx.r8.u64=0x82839AA0;s.ctx.f1.f64=scale;
         api->call(reinterpret_cast<WmlContext*>(&s.ctx),0x8264E988);
     }
 }
@@ -237,22 +320,37 @@ void DrawPanel(WmlContext* raw,float map_left,float map_top,float map_right,floa
     PanelText(s,"Graffiti",x+pad,y+111*ui,.82f*ui,purple);
     PanelText(s,tags_ready?std::to_string(tags)+" / 75":"-- / 75",x+w-pad,y+111*ui,.82f*ui,white,false,true);
     PanelRect(s,x+pad,y+139*ui,w-2*pad,ui,150,150,150,120);
-    // Match the port's 32-pixel keyboard prompts: rounded pale rim,
-    // dark inset face and a small drop shadow.
-    PanelColor(s,255,255,255);
-    if(!assets_ready||!PanelBitmap(s,asset_bitmaps[2],x+pad,y+151*ui,32*ui,32*ui)){
-        PanelRoundedRect(s,x+pad+ui,y+154*ui,30*ui,30*ui,6*ui,0,0,0,170);
-        PanelRoundedRect(s,x+pad+ui,y+152*ui,30*ui,30*ui,6*ui,236,236,236,255);
-        PanelRoundedRect(s,x+pad+3*ui,y+154*ui,26*ui,25*ui,4*ui,52,52,56,255);
-        PanelText(s,"F7",x+pad+6*ui,y+166*ui,.59f*ui,white);
+    SelectorState view;
+    {std::lock_guard lock(selector_mutex);
+        selector.left=s.X(x+pad)/sw;selector.right=s.X(x+w-pad)/sw;
+        selector.top=s.Y(y+171*ui)/sh;selector.bottom=s.Y(y+201*ui)/sh;
+        selector.ready=opacity>.99f&&std::abs(s.scale_x-1)<.02f&&std::abs(s.scale_y-1)<.02f;
+        view=selector;
     }
-    PanelText(s,"MARKERS",x+pad+45*ui,y+167*ui,.70f*ui,white);
+    PanelText(s,"MARKERS",x+pad,y+157*ui,.62f*ui,white);
+    PanelRoundedRect(s,x+pad,y+171*ui,w-2*pad,30*ui,3*ui,15,15,18,155);
+    if(view.focused){
+        PanelRect(s,x+pad+3*ui,y+171*ui,w-2*pad-6*ui,ui,220,190,96,180);
+        PanelRect(s,x+pad+3*ui,y+200*ui,w-2*pad-6*ui,ui,220,190,96,180);
+    }
     const char* names[]={"OFF","CDs","GRAFFITI","ALL"};
-    PanelText(s,names[mode.load()],x+pad,y+200*ui,.72f*ui,gold);
+    const std::array<unsigned,3> ink=view.focused?white:gold;
+    PanelText(s,"<",x+pad+9*ui,y+186*ui,.72f*ui,ink);
+    PanelText(s,names[mode.load()],x+w*.5f,y+186*ui,.72f*ui,ink,false,false,true);
+    PanelText(s,">",x+w-pad-9*ui,y+186*ui,.72f*ui,ink,false,true);
+    PanelText(s,view.focused?"DOWN: MAP FILTERS":"UP: SELECT MARKERS",x+w*.5f,y+214*ui,.42f*ui,grey,false,false,true);
+    if(view.pointer&&view.ready){
+        // A small native-rendered pointer follows the captured mouse. It is
+        // drawn after the panel transform, in final viewport coordinates.
+        const float old_x=s.scale_x,old_y=s.scale_y;s.scale_x=s.scale_y=1;
+        const float px=view.cursor_x*sw,py=view.cursor_y*sh;
+        for(int row=0;row<12;++row){const float width=std::min(7,row/2+1)*ui;PanelRect(s,px,py+row*ui,width,ui,0,0,0,255);if(row>1&&width>2*ui)PanelRect(s,px+ui,py+row*ui,width-2*ui,ui,245,245,245,255);}
+        s.scale_x=old_x;s.scale_y=old_y;
+    }
     s.opacity=1;PanelColor(s,saved[0],saved[1],saved[2],saved[3]);
 }
 void Map(WmlContext* ctx,uint8_t* base){
-    if(!enabled||!SinglePlayer()){original_map(ctx,base);return;}
+    if(!enabled||!SinglePlayer()||!ActiveMap()){original_map(ctx,base);return;}
     try{Snapshot();}catch(const std::exception& e){enabled=false;Log(e.what());original_map(ctx,base);return;}
     float left=-1,top=-1,right=-1,bottom=-1;
     const auto tl=uint32_t(api->get_r(ctx,5)),br=uint32_t(api->get_r(ctx,6));
@@ -265,7 +363,7 @@ void Map(WmlContext* ctx,uint8_t* base){
 }
 void Frame(void*){
     const bool visible=enabled&&SinglePlayer()&&GetTickCount64()-map_seen.load()<250;
-    if(visible&&api->key_pressed(VK_F7)){static const unsigned next[]={3,2,0,1};mode=next[mode.load()];Log("Marker mode "+std::to_string(mode.load()));}
+    if(!visible){std::lock_guard lock(selector_mutex);selector.ready=selector.focused=selector.pointer=selector.capture_click=false;}
 }
 }
 extern "C" WML_EXPORT int wml_mod_init(const WmlApi* loader,const WmlMod* mod){
@@ -280,8 +378,8 @@ extern "C" WML_EXPORT int wml_mod_init(const WmlApi* loader,const WmlMod* mod){
         Log("Read 60 CD and 75 graffiti locations from the installed game");
     }catch(const std::exception& e){Log(e.what());return 1;}
     struct Hook{uint32_t address;WmlGuestFunction replacement;WmlGuestFunction* previous;};
-    Hook hooks[]={{0x822B3F70,Map,&original_map},{0x822EDC50,Batch,&original_batch},{0x822E98B8,MiniBatch,&original_minibatch},{0x822EE5E8,Position,&original_pos},{0x8263E7D8,Color,&original_color},{0x8227E720,Bitmap,&original_bitmap}};
+    Hook hooks[]={{0x822B3F70,Map,&original_map},{0x822EDC50,Batch,&original_batch},{0x822E98B8,MiniBatch,&original_minibatch},{0x822EE5E8,Position,&original_pos},{0x8263E7D8,Color,&original_color},{0x8227E720,Bitmap,&original_bitmap},{0x82788EC4,ObserveInput,&original_input},{0x822B6548,MapUpdate,&original_update},{0x8216EE80,MapAction,&original_action},{0x822B6160,MapPan,&original_pan}};
     bool good=true;for(const auto& h:hooks)if(api->hook(h.address,h.replacement,h.previous)){good=false;Log("Required map hook unavailable; tracker disabled");break;}
-    enabled=good;if(good){api->on_frame(Frame,nullptr);Log("Ready: open the map; F7 cycles Both / CDs / Graffiti / Off");}
+    enabled=good;if(good){api->on_frame(Frame,nullptr);Log("Ready: map-side marker selector; mouse arrows or D-pad Up then Left/Right, Down returns to map filters");}
     return 0;
 }

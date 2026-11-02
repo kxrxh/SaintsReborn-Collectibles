@@ -19,7 +19,7 @@ def tiled_offset(x, y, width):
             + (((((y & 8) >> 2) + (x >> 3)) & 3) << 6)) >> log_bpp
 
 atlas = Image.new('RGBA', (128, 64))
-for name, x, size in [('cd', 1, 38), ('graffiti', 41, 38), ('f7', 81, 32)]:
+for name, x, size in [('cd', 1, 38), ('graffiti', 41, 38)]:
     with Image.open(ASSETS / f'{name}.png') as image:
         assert image.size == (size, size)
         atlas.paste(image.convert('RGBA'), (x, 1))
@@ -35,4 +35,4 @@ for y in range(64):
         payload[dst:dst+4] = bytes((a,r,g,b))
 assert len(used) == 128*64
 (ASSETS / 'ui-atlas.bin').write_bytes(payload)
-print('Baked 38x38 collectible badges and 32x32 F7 prompt into ui-atlas.bin')
+print('Baked 38x38 collectible badges into ui-atlas.bin')

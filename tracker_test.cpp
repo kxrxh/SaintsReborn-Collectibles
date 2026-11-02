@@ -41,6 +41,7 @@ int Call(WmlContext* c,uint32_t fn){
 }
 void NativePos(WmlContext*,uint8_t*){++pos_fallbacks;}
 void NativeBitmap(WmlContext* c,uint8_t*){drawn_bitmap=uint32_t(R(c,3));}
+void NativeAction(WmlContext* c,uint8_t*){RS(c,3,1);}
 void NativeBatch(WmlContext* raw,uint8_t*){
     if(!custom_draw){++native_batches;return;}
     ++extra_batches;
@@ -80,15 +81,16 @@ int main(int argc,char** argv){
     for(unsigned m=0;m<4;++m){assert(tracker::Visible(tracker::Kind::CD,m)==bool(m&1));assert(tracker::Visible(tracker::Kind::Graffiti,m)==bool(m&2));}
     memory[0x82700000].resize(0x100000);memory[0x82FF0000].resize(0x10000);memory[0x83000000].resize(0x100000);memory[0x83700000].resize(0x20000);
     memory[0x90000000].resize(0x20000);memory[0x91000000].resize(0x20000);memory[0x70000000].resize(0x20000);
-    memory[0x83A00000].resize(0x10000);memory[0x82080000].resize(0x10000);
+    memory[0x83A00000].resize(0x10000);memory[0x839E0000].resize(0x10000);memory[0x82080000].resize(0x10000);
     mock.version=1;mock.size=sizeof(mock);mock.log=LogFake;mock.read_u8=U8;mock.read_u16=U16;mock.read_u32=U32;mock.read_f32=Float;
     mock.write_u8=W8;mock.write_u16=W16;mock.write_u32=W32;mock.write_f32=WF;mock.guest_pointer=Pointer;mock.get_r=R;mock.set_r=RS;
     mock.call=Call;mock.overlay_text=Overlay;mock.key_pressed=Key;api=&mock;static WmlMod mod{"Collectibles","test"};self=&mod;
-    original_map=NativeMap;original_batch=NativeBatch;original_minibatch=NativeMini;original_pos=NativePos;original_color=NativeColor;original_bitmap=NativeBitmap;enabled=true;
+    original_map=NativeMap;original_batch=NativeBatch;original_minibatch=NativeMini;original_pos=NativePos;original_color=NativeColor;original_bitmap=NativeBitmap;original_action=NativeAction;enabled=true;
     W32(0x90012000,1280);W32(0x90012004,720);WF(0x82FFB4E8,1);WF(0x82FFB4EC,1);
     WF(0x82089770,67);WF(0x827AF11C,.000001f);
     W32(0x827D6D1C,1);W32(0x827D6D20,2);W32(0x827D6D14,3);W32(0x827D6D10,4);
     W32(0x8309ABEC,0x90000000);W32(0x90000000+21228,1);
+    W32(0x8370DDAC,26);
     for(const auto& l:locations)if(l.kind==tracker::Kind::CD){W32(0x90000000+20988,l.id);break;}
     unsigned tag=0;for(const auto& l:locations)if(l.kind==tracker::Kind::Graffiti){auto n=0x91000000+tag*28,d=0x91010000+tag*64;W32(n+4,d);W32(d,l.id);W8(n,tag<2?0x40:0);W32(n+20,0x91000000+((tag+1)%75)*28);++tag;}
     W32(0x827E2644,0x91000000);W32(kHead,0x90002000);
@@ -99,7 +101,26 @@ int main(int argc,char** argv){
     assert(U32(kHead)==0x90002000&&color_state==colors&&std::memcmp(&ctx,&before,sizeof(ctx))==0);
     assert(memory==saved); // no progress, mission-list or stack changes survive the draw
     Frame(nullptr);assert(overlay.empty());assert(std::find(labels.begin(),labels.end(),"1 / 60")!=labels.end()&&std::find(labels.begin(),labels.end(),"2 / 75")!=labels.end());
-    pressed=true;Frame(nullptr);assert(mode==1);pressed=true;Frame(nullptr);assert(mode==2);pressed=true;Frame(nullptr);assert(mode==0);pressed=true;Frame(nullptr);assert(mode==3);
+    selector={};selector.ready=true;selector.left=.1f;selector.right=.3f;selector.top=.7f;selector.bottom=.9f;
+    assert(SelectInput(kRight,false,0,0)==kRight&&mode==3);SelectInput(0,false,0,0);
+    assert(SelectInput(kUp,false,0,0)==0&&selector.focused);SelectInput(0,false,0,0);
+    assert(SelectInput(kRight,false,0,0)==0&&mode==1);SelectInput(kRight,false,0,0);assert(mode==1);
+    SelectInput(0,false,0,0);SelectInput(kRight,false,0,0);assert(mode==2);
+    SelectInput(0,false,0,0);SelectInput(kRight,false,0,0);assert(mode==0);
+    SelectInput(0,false,0,0);SelectInput(kLeft,false,0,0);assert(mode==2);
+    SelectInput(0,false,0,0);SelectInput(kDown,false,0,0);assert(!selector.focused);
+    assert(SelectInput(kRight,false,0,0)==kRight&&mode==2);SelectInput(0,false,0,0);
+    SelectInput(0,false,-.25f,.3f);assert(selector.focused&&selector.pointer);
+    assert(SelectInput(kAccept,true,0,0)==0&&mode==0); // click right half cycles once
+    assert(SelectInput(kAccept,true,.5f,0)==0&&mode==0); // dragging out cannot place a waypoint
+    SelectInput(0,false,0,0);assert(SelectInput(kAccept,true,0,0)==kAccept); // outside widget: normal map click
+    for(const auto navigation:{0x10,0x20,0x100,0x200,0x2000,0x8000}){
+        selector.focused=selector.pointer=selector.capture_click=true;
+        assert(SelectInput(uint16_t(navigation),true,0,0)==navigation&&!selector.focused&&!selector.capture_click);
+    }
+    W32(0x8370DDAC,46);auto previous_batches=extra_batches;Map(raw,nullptr);assert(extra_batches==previous_batches);
+    W32(0x8370DDAC,26);
+    selector={};mode=3;
     const auto batches=extra_batches;mode=0;Map(raw,nullptr);assert(extra_batches==batches);
     mode=1;marker_draws=0;Map(raw,nullptr);assert(marker_draws==59);
     mode=2;marker_draws=0;Map(raw,nullptr);assert(marker_draws==73);
@@ -119,8 +140,8 @@ int main(int argc,char** argv){
     memory[0xA0000000].resize(0x9000);
     std::ifstream asset(std::filesystem::path(__FILE__).parent_path()/"assets"/"ui-atlas.bin",std::ios::binary);
     atlas_data.assign(std::istreambuf_iterator<char>(asset),{});assert(atlas_data.size()==32768);
-    {Scratch s(raw);EnsureAssets(s);}assert(assets_ready&&U32(0x8370DD60)==3&&U32(0x8370DD5C)==1);
-    assert(U32(0x82FFAEC8+4)==1737&&U32(0x82FF5EC8+12)==38&&U32(0x82FF5EC8+2*20+12)==32);
+    {Scratch s(raw);EnsureAssets(s);}assert(assets_ready&&U32(0x8370DD60)==2&&U32(0x8370DD5C)==1);
+    assert(U32(0x82FFAEC8+4)==1737&&U32(0x82FF5EC8+12)==38&&U32(0x82FF5EC8+20+12)==38);
     assert(!std::memcmp(Pointer(0xA0001000),atlas_data.data(),atlas_data.size()));
     WF(0x827AF11C,1);
     tracker::Location nearby{tracker::Kind::CD,0,{30,0,0},"test"};assert(InsideMinimap(nearby));
@@ -128,5 +149,11 @@ int main(int argc,char** argv){
     custom_draw=true;marker_kind=tracker::Kind::CD;Bitmap(raw,nullptr);assert(drawn_bitmap==asset_bitmaps[0]);
     marker_kind=tracker::Kind::Graffiti;Bitmap(raw,nullptr);assert(drawn_bitmap==asset_bitmaps[1]);
     custom_draw=false;RS(raw,3,148);Bitmap(raw,nullptr);assert(drawn_bitmap==148);
+    selector.focused=selector.capture_click=true;map_input_scope=true;
+    for(auto action:{43,44,55}){RS(raw,3,action);MapAction(raw,nullptr);assert(R(raw,3)==0);}
+    for(auto action:{0,37,38,56,57,58}){RS(raw,3,action);MapAction(raw,nullptr);assert(R(raw,3)==1);}
+    map_input_scope=false;
+    for(auto action:{43,44,55,56}){RS(raw,3,action);MapAction(raw,nullptr);assert(R(raw,3)==1);}
+    selector={};
     std::cout<<"PASS: native CRC IDs, synthetic CTS parsing, all 135 installed locations, per-save completion filtering, four marker modes, native-font panel, full map and minimap passes, native minimap culling flags, map head/CPU context/stack/color restoration, failure restoration and multiplayer exclusion\n";
 }
