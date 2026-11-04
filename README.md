@@ -46,6 +46,8 @@ No compiling is needed to play. Load your normal save and open the map with **M*
 
 Counts remain visible with markers off. Minimap icons appear only when the whole badge fits inside the radar. Selector clicks do not place waypoints; tab switching and closing the map keep their normal controls.
 
+The side panel hides when the window is too narrow. The normal map controls remain available.
+
 Set `markers` in `mod.ini` to choose the initial mode: `0` off, `1` CDs, `2` graffiti, `3` all.
 
 ## Compatibility and removal
@@ -67,7 +69,7 @@ Requires Visual Studio 2022 C++ Build Tools and a Saints Reborn source/build ins
 .\Build.ps1 -GameRoot "C:\Games\SaintsReborn" -Test
 ```
 
-The tests cover location parsing, completion filtering, map/minimap rendering, radar bounds, selector input, navigation pass-through and CPU context, stack, color and native icon-list restoration.
+The tests cover valid and damaged packfiles, completion filtering, map/minimap rendering, badge corners at different HUD scales, connected selector input hooks, hidden-panel input release, navigation pass-through and CPU context, stack, color and native icon-list restoration.
 
 To rebuild the UI atlas from the included PNGs, run `python BakeAssets.py` with Pillow installed. The asset baker reads no game files.
 

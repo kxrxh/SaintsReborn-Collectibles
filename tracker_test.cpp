@@ -1,4 +1,25 @@
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+namespace {
+bool input_focus=true;POINT input_cursor{640,360};
+HWND TestForeground(){return input_focus?reinterpret_cast<HWND>(1):nullptr;}
+DWORD TestWindowProcess(HWND,DWORD* process){*process=GetCurrentProcessId();return 1;}
+BOOL TestClientRect(HWND,RECT* rect){*rect={0,0,1280,720};return TRUE;}
+BOOL TestCursorPos(POINT* point){*point=input_cursor;return TRUE;}
+BOOL TestScreenToClient(HWND,POINT*){return TRUE;}
+}
+#define GetForegroundWindow TestForeground
+#define GetWindowThreadProcessId TestWindowProcess
+#define GetClientRect TestClientRect
+#define GetCursorPos TestCursorPos
+#define ScreenToClient TestScreenToClient
 #include "tracker.cpp"
+#undef GetForegroundWindow
+#undef GetWindowThreadProcessId
+#undef GetClientRect
+#undef GetCursorPos
+#undef ScreenToClient
 #include <cassert>
 #include <iostream>
 #include <map>
@@ -10,6 +31,10 @@ std::array<unsigned,4> color_state{11,22,33,144};std::string overlay;
 std::vector<std::string> labels;
 uint32_t drawn_bitmap=0;
 std::vector<std::array<int,5>> rectangles;
+std::array<uint8_t,16> input_packet{0x12,0x34,0x56,0x78,0,0,0,0,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88};
+std::array<bool,256> keys{};
+std::map<unsigned,uint64_t> actions;unsigned pans=0;bool fail_update=false;
+constexpr uint16_t kAccept=0x1000;
 void* Pointer(uint32_t a){auto it=memory.upper_bound(a);if(it==memory.begin())return nullptr;--it;auto n=uint64_t(a)-it->first;return n<it->second.size()?it->second.data()+n:nullptr;}
 uint8_t U8(uint32_t p){auto a=Pointer(p);assert(a);return *static_cast<uint8_t*>(a);}
 uint16_t U16(uint32_t p){return uint16_t(U8(p))<<8|U8(p+1);}
@@ -41,6 +66,120 @@ int Call(WmlContext* c,uint32_t fn){
 void NativePos(WmlContext*,uint8_t*){++pos_fallbacks;}
 void NativeBitmap(WmlContext* c,uint8_t*){drawn_bitmap=uint32_t(R(c,3));}
 void NativeAction(WmlContext* c,uint8_t*){RS(c,3,1);}
+void NativeInput(WmlContext* c,uint8_t*){
+    std::memcpy(Pointer(uint32_t(R(c,5))),input_packet.data(),input_packet.size());RS(c,3,0);input_cursor={640,360};
+}
+void NativePan(WmlContext*,uint8_t*){++pans;}
+void NativeUpdate(WmlContext* c,uint8_t* b){
+    for(auto action:{43,44,55,56,57,58}){RS(c,3,action);MapAction(c,b);actions[action]=R(c,3);}
+    MapPan(c,b);if(fail_update)throw std::runtime_error("Simulated update failure");
+}
+void Poll(WmlContext* c,uint16_t buttons=0,bool mouse=false){
+    input_packet[4]=uint8_t(buttons>>8);input_packet[5]=uint8_t(buttons);keys[VK_LBUTTON]=mouse;
+    RS(c,3,0);RS(c,5,0x90013000);map_seen=GetTickCount64();ObserveInput(c,nullptr);
+    assert(R(c,3)==0&&!std::memcmp(Pointer(0x90013000),input_packet.data(),input_packet.size()));
+}
+
+struct PackFixture{
+    std::filesystem::path path;std::vector<uint8_t> bytes;
+    void Put(size_t at,uint32_t value){for(unsigned i=0;i<4;++i)bytes.at(at+i)=uint8_t(value>>(24-8*i));}
+    explicit PackFixture(unsigned flags=1,bool flushed=false){
+        std::string text="#Navpoints\n";
+        for(unsigned i=0;i<60;++i)text+="$Navpoint: \"nav"+std::to_string(i)+"\"\n$Pos: <1 2 3>\n";
+        text+="#Items\n";
+        for(unsigned i=0;i<60;++i)text+="$Item: \"cd"+std::to_string(i)+"\"\n$Item type: \"CD_collect\"\n$Start nav: \"nav"+std::to_string(i)+"\"\n";
+        text+="#Tagging Spots\n";
+        for(unsigned i=0;i<75;++i)text+="$Tagging Spot: \"tag"+std::to_string(i)+"\"\n$Pos: <4 5 6>\n+Ambient\n";
+        std::vector<uint8_t> data(text.begin(),text.end());
+        if(flags&1){
+            std::vector<uint8_t> compressed(compressBound(uLong(data.size()))+6);z_stream stream{};
+            assert(deflateInit(&stream,Z_DEFAULT_COMPRESSION)==Z_OK);
+            stream.next_in=data.data();stream.avail_in=uInt(data.size());stream.next_out=compressed.data();stream.avail_out=uInt(compressed.size());
+            assert(deflate(&stream,flushed?Z_SYNC_FLUSH:Z_FINISH)==(flushed?Z_OK:Z_STREAM_END));
+            const auto size=stream.total_out;const auto result=deflateEnd(&stream);
+            assert(result==(flushed?Z_DATA_ERROR:Z_OK)); // An intentionally unfinished stream is still freed.
+            compressed.resize(size);data=std::move(compressed);
+        }
+        bytes.resize(0x1800+data.size());std::copy(data.begin(),data.end(),bytes.begin()+0x1800);
+        Put(0,0x51890ACE);Put(4,3);Put(0x14C,flags);Put(0x154,1);Put(0x15C,28);Put(0x160,15);Put(0x164,uint32_t(text.size()));Put(0x168,uint32_t(data.size()));
+        Put(0x800+16,uint32_t(text.size()));Put(0x800+20,uint32_t(data.size()));
+        constexpr char name[]="lc_tagging.cts";std::memcpy(bytes.data()+0x1000,name,sizeof(name));
+        wchar_t temp[MAX_PATH],file[MAX_PATH];assert(GetTempPathW(MAX_PATH,temp));assert(GetTempFileNameW(temp,L"sct",0,file));path=file;
+    }
+    ~PackFixture(){std::error_code ignored;std::filesystem::remove(path,ignored);}
+    std::vector<tracker::Location> Load(){
+        {std::ofstream out(path,std::ios::binary|std::ios::trunc);out.write(reinterpret_cast<const char*>(bytes.data()),bytes.size());assert(out.good());}
+        return tracker::Pack(path).Locations();
+    }
+};
+void Reject(PackFixture& fixture,const char* message){
+    bool rejected=false;try{fixture.Load();}catch(const std::runtime_error& e){rejected=true;assert(std::string(e.what())==message);}assert(rejected);
+}
+void TestPackFiles(){
+    for(unsigned flags=0;flags<4;++flags){PackFixture valid(flags);assert(valid.Load().size()==135);}
+    for(unsigned flags:{1,3}){PackFixture valid(flags,true);assert(valid.Load().size()==135);}
+    PackFixture bad_checksum;bad_checksum.bytes.back()^=1;Reject(bad_checksum,"Cannot decompress packfile entry");
+    PackFixture truncated;truncated.bytes.pop_back();truncated.Put(0x800+20,uint32_t(truncated.bytes.size()-0x1800));Reject(truncated,"Cannot decompress packfile entry");
+    PackFixture oversized;oversized.Put(0x800+20,64*1024*1024);Reject(oversized,"Invalid packfile range");
+    PackFixture directory;directory.Put(0x15C,0xFFFFF800);Reject(directory,"Invalid packfile range");
+    PackFixture offset(0);offset.Put(0x800+8,0xFFFFF000);Reject(offset,"Invalid packfile range");
+    PackFixture condensed(3);condensed.Put(0x168,0xFFFFFFFF);Reject(condensed,"Invalid packfile range");
+    PackFixture flush_marker(1,true);flush_marker.bytes.pop_back();flush_marker.Put(0x800+20,uint32_t(flush_marker.bytes.size()-0x1800));Reject(flush_marker,"Cannot decompress packfile entry");
+    PackFixture corrupt_stream(1,true);corrupt_stream.bytes[0x1800]^=1;Reject(corrupt_stream,"Cannot decompress packfile entry");
+}
+void TestSelectorInput(WmlContext* raw){
+    original_input=NativeInput;original_update=NativeUpdate;original_pan=NativePan;
+    mock.key_down=[](int vk){return keys.at(vk)?1:0;};
+    enabled=true;mode=3;selector={};W8(0x8370E9F6,0);W32(0x8370DDAC,26);
+    const auto background=U32(0x827B05E8);W32(0x827B05E8,4096);
+    const auto show=[&]{DrawPanel(raw,330,190,950,530,1);assert(selector.ready);};
+    const auto update=[&](uint64_t filters,uint64_t waypoint,bool pan){
+        const auto before=pans;MapUpdate(raw,nullptr);assert(!map_input_scope);
+        assert(actions[43]==filters&&actions[44]==filters&&actions[55]==waypoint);
+        for(auto action:{56,57,58})assert(actions[action]==1);
+        assert(pans==before+unsigned(pan));
+    };
+    show();Poll(raw,kRight);assert(mode==3);update(1,1,true);Poll(raw);
+    Poll(raw,kUp);assert(selector.focused);update(0,1,true);Poll(raw);
+    Poll(raw,kRight);assert(mode==1);Poll(raw,kRight);assert(mode==1); // held button cycles once
+    Poll(raw);Poll(raw,kRight);assert(mode==2);
+    Poll(raw);Poll(raw,kRight);assert(mode==0);
+    Poll(raw);Poll(raw,kLeft);assert(mode==2);
+    Poll(raw);Poll(raw,kDown);assert(!selector.focused);update(1,1,true);Poll(raw);
+
+    input_cursor={int((selector.left+selector.right)*.5f*1280),int((selector.top+selector.bottom)*.5f*720)};
+    Poll(raw);assert(selector.pointer&&selector.focused);
+    Poll(raw,kAccept,true);assert(mode==0&&selector.capture_click);update(0,0,false);
+    keys['W']=true;update(0,0,true);keys['W']=false;
+    input_cursor={1100,360};Poll(raw,kAccept,true);assert(mode==0&&selector.capture_click&&!selector.focused);update(1,0,true);
+    Poll(raw);Poll(raw,kAccept,true);assert(mode==0&&!selector.capture_click);update(1,1,true);Poll(raw);
+    for(const auto navigation:{0x10,0x20,0x100,0x200,0x2000,0x8000}){
+        selector.focused=selector.pointer=selector.capture_click=true;
+        Poll(raw,uint16_t(navigation));assert(mode==0&&!selector.focused&&!selector.capture_click);update(1,1,true);
+    }
+    for(auto menu:{46,0}){ // Co-op and leaving pause never inherit selector input.
+        show();Poll(raw);Poll(raw,kUp);W32(0x8370DDAC,menu);Map(raw,nullptr);
+        assert(!selector.ready&&!selector.focused);Poll(raw,kRight);assert(mode==0);update(1,1,true);
+        W32(0x8370DDAC,26);
+    }
+    show();Poll(raw);Poll(raw,kUp);
+    W32(0x90012000,960);labels.clear();rectangles.clear();DrawPanel(raw,170,190,790,530,1);
+    assert(labels.empty()&&rectangles.empty()&&!selector.ready&&!selector.focused&&!selector.capture_click);
+    Poll(raw,kRight);assert(mode==0);update(1,1,true);
+    W32(0x90012000,1280);show();assert(!selector.focused);
+    Poll(raw);Poll(raw,kUp);DrawPanel(raw,330,190,950,530,0);
+    assert(!selector.ready&&!selector.focused);update(1,1,true);
+    show();Poll(raw);Poll(raw,kUp);DrawPanel(raw,485,275,795,445,.5f);
+    assert(!selector.ready&&!selector.focused);update(1,1,true);
+    selector.focused=selector.pointer=selector.capture_click=true;update(1,1,true); // readiness also gates native actions
+    HideSelector();show();Poll(raw);Poll(raw,kUp);
+    input_focus=false;Poll(raw,kRight);assert(mode==0&&!selector.focused);update(1,1,true);input_focus=true;
+    Poll(raw);Poll(raw,kUp);input_packet[6]=128;Poll(raw,kRight);assert(mode==0&&!selector.focused);update(1,1,true);input_packet[6]=0;
+    fail_update=true;bool failed=false;try{MapUpdate(raw,nullptr);}catch(const std::runtime_error&){failed=true;}
+    assert(failed&&!map_input_scope);fail_update=false;
+    map_seen=GetTickCount64()-500;Frame(nullptr);assert(!selector.ready&&!selector.focused);
+    W32(0x827B05E8,background);selector={};keys={};mode=3;
+}
 void NativeBatch(WmlContext* raw,uint8_t*){
     if(!custom_draw){++native_batches;return;}
     ++extra_batches;
@@ -67,8 +206,9 @@ void NativeMini(WmlContext* raw,uint8_t* base){
 }
 void NativeMap(WmlContext* c,uint8_t* b){Batch(c,b);Batch(c,b);}
 }
-int main(int argc,char** argv){
+int main(int argc,char** argv)try{
     assert(argc==2);auto game=std::filesystem::path(argv[1]);
+    TestPackFiles();
     assert(tracker::NameId("123456789")==0x2DFD2D88u);assert(tracker::NameId("A")!=tracker::NameId("a"));
     std::vector<tracker::Location> sample;
     tracker::ParseScript("test.cts","#Navpoints\n$Navpoint: \"test_cd\"\n$Pos: <1, 2, 3>\n#Items\n$Item: \"sample\"\n$Item type: \"CD_collect\"\n$Start nav: \"test_cd\"\n#End\n",sample);
@@ -100,23 +240,6 @@ int main(int argc,char** argv){
     assert(U32(kHead)==0x90002000&&color_state==colors&&std::memcmp(&ctx,&before,sizeof(ctx))==0);
     assert(memory==saved); // no progress, mission-list or stack changes survive the draw
     Frame(nullptr);assert(overlay.empty());assert(std::find(labels.begin(),labels.end(),"1 / 60")!=labels.end()&&std::find(labels.begin(),labels.end(),"2 / 75")!=labels.end());
-    selector={};selector.ready=true;selector.left=.1f;selector.right=.3f;selector.top=.7f;selector.bottom=.9f;
-    assert(SelectInput(kRight,false,0,0)==kRight&&mode==3);SelectInput(0,false,0,0);
-    assert(SelectInput(kUp,false,0,0)==0&&selector.focused);SelectInput(0,false,0,0);
-    assert(SelectInput(kRight,false,0,0)==0&&mode==1);SelectInput(kRight,false,0,0);assert(mode==1);
-    SelectInput(0,false,0,0);SelectInput(kRight,false,0,0);assert(mode==2);
-    SelectInput(0,false,0,0);SelectInput(kRight,false,0,0);assert(mode==0);
-    SelectInput(0,false,0,0);SelectInput(kLeft,false,0,0);assert(mode==2);
-    SelectInput(0,false,0,0);SelectInput(kDown,false,0,0);assert(!selector.focused);
-    assert(SelectInput(kRight,false,0,0)==kRight&&mode==2);SelectInput(0,false,0,0);
-    SelectInput(0,false,-.25f,.3f);assert(selector.focused&&selector.pointer);
-    assert(SelectInput(kAccept,true,0,0)==0&&mode==0); // click right half cycles once
-    assert(SelectInput(kAccept,true,.5f,0)==0&&mode==0); // dragging out cannot place a waypoint
-    SelectInput(0,false,0,0);assert(SelectInput(kAccept,true,0,0)==kAccept); // outside widget: normal map click
-    for(const auto navigation:{0x10,0x20,0x100,0x200,0x2000,0x8000}){
-        selector.focused=selector.pointer=selector.capture_click=true;
-        assert(SelectInput(uint16_t(navigation),true,0,0)==navigation&&!selector.focused&&!selector.capture_click);
-    }
     W32(0x8370DDAC,46);auto previous_batches=extra_batches;Map(raw,nullptr);assert(extra_batches==previous_batches);
     W32(0x8370DDAC,26);
     selector={};mode=3;
@@ -145,14 +268,21 @@ int main(int argc,char** argv){
     WF(0x827AF11C,1);
     tracker::Location nearby{tracker::Kind::CD,0,{30,0,0},"test"};assert(InsideMinimap(nearby));
     nearby.pos[0]=47;assert(!InsideMinimap(nearby));nearby.pos[0]=130;assert(!InsideMinimap(nearby));
+    for(const float hud:{.75f,1.f,2.f}){
+        WF(0x82FFB4E8,hud);WF(0x82FFB4EC,hud);
+        for(unsigned angle=0;angle<360;angle+=15){
+            const float radians=angle*3.14159265f/180;
+            nearby.kind=tracker::Kind::Graffiti;nearby.pos={45.9f*hud*std::cos(radians),0,45.9f*hud*std::sin(radians)};assert(!InsideMinimap(nearby));
+            nearby.pos={37.f*hud*std::cos(radians),0,37.f*hud*std::sin(radians)};assert(InsideMinimap(nearby));
+            assert(std::hypot(nearby.pos[0],nearby.pos[2])+std::hypot(19.f,19.f)*hud+2*hud<=67*hud);
+        }
+    }
+    WF(0x82FFB4E8,1);WF(0x82FFB4EC,1);
     custom_draw=true;marker_kind=tracker::Kind::CD;Bitmap(raw,nullptr);assert(drawn_bitmap==asset_bitmaps[0]);
     marker_kind=tracker::Kind::Graffiti;Bitmap(raw,nullptr);assert(drawn_bitmap==asset_bitmaps[1]);
     custom_draw=false;RS(raw,3,148);Bitmap(raw,nullptr);assert(drawn_bitmap==148);
-    selector.focused=selector.capture_click=true;map_input_scope=true;
-    for(auto action:{43,44,55}){RS(raw,3,action);MapAction(raw,nullptr);assert(R(raw,3)==0);}
-    for(auto action:{0,37,38,56,57,58}){RS(raw,3,action);MapAction(raw,nullptr);assert(R(raw,3)==1);}
-    map_input_scope=false;
-    for(auto action:{43,44,55,56}){RS(raw,3,action);MapAction(raw,nullptr);assert(R(raw,3)==1);}
-    selector={};
-    std::cout<<"PASS: native CRC IDs, synthetic CTS parsing, all 135 installed locations, per-save completion filtering, four marker modes, native-font panel, full map and minimap passes, native minimap culling flags, map head/CPU context/stack/color restoration, failure restoration and multiplayer exclusion\n";
+    TestSelectorInput(raw);
+    std::cout<<"PASS: valid/corrupt packfiles, native CRC IDs, CTS parsing, all 135 installed locations, completion filtering, map/minimap rendering and state restoration, diagonal radar bounds at multiple HUD scales, connected input hooks, hidden-panel input release, tab/close pass-through and multiplayer exclusion\n";
+}catch(const std::exception& e){
+    std::cerr<<"FAIL: "<<e.what()<<'\n';return 1;
 }

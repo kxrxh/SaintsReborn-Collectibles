@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Release selector input when the panel is hidden or the map is closing.
+- Keep badge corners inside the minimap.
+- Reject invalid packfile ranges, damaged compressed streams and truncated flush markers.
+- Test the connected mouse/controller hooks, tab switching and hidden-panel controls.
+
 ## 0.3.0
 
 First public release.

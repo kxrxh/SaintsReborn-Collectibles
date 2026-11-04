@@ -63,19 +63,42 @@ inline void Validate(const std::vector<Location>& locations){
     if(cds!=60||tags!=75)throw std::runtime_error("Expected 60 CDs and 75 graffiti locations; game data differs");
 }
 class Pack {
-    struct Entry{std::string name;uint32_t offset,size,stored;};
-    std::filesystem::path path;std::vector<Entry> entries;uint32_t flags=0,data_at=0,blob_size=0,stored_size=0;
+    static constexpr size_t kMaxBlockSize=128*1024*1024;
+    struct Entry{std::string name;uint64_t offset;uint32_t size,stored;};
+    std::filesystem::path path;std::vector<Entry> entries;uint32_t flags=0,blob_size=0,stored_size=0;uint64_t data_at=0;
     std::vector<uint8_t> blob;
-    static uint32_t Align(uint32_t n){return (n+2047)&~2047u;}
+    static uint64_t Align(uint64_t n){return (n+2047)&~uint64_t(2047);}
     static uint32_t Be(const std::vector<uint8_t>& b,size_t p){if(p+4>b.size())throw std::runtime_error("Truncated packfile");return uint32_t(b[p])<<24|uint32_t(b[p+1])<<16|uint32_t(b[p+2])<<8|b[p+3];}
-    static std::vector<uint8_t> ReadAt(std::ifstream& in,uint64_t offset,size_t size){std::vector<uint8_t> b(size);in.seekg(offset);if(!in.read(reinterpret_cast<char*>(b.data()),size))throw std::runtime_error("Cannot read packfile");return b;}
+    static std::vector<uint8_t> ReadAt(std::ifstream& in,uint64_t offset,size_t size){
+        in.seekg(0,std::ios::end);
+        const auto length=in.tellg();
+        if(length<0||offset>uint64_t(length)||size>uint64_t(length)-offset||size>kMaxBlockSize)
+            throw std::runtime_error("Invalid packfile range");
+        in.seekg(offset);
+        std::vector<uint8_t> bytes(size);
+        if(!in.read(reinterpret_cast<char*>(bytes.data()),size))
+            throw std::runtime_error("Cannot read packfile");
+        return bytes;
+    }
     static std::vector<uint8_t> Inflate(const std::vector<uint8_t>& data,uint32_t size){
-        if(size>128*1024*1024)throw std::runtime_error("Packfile entry too large");
-        std::vector<uint8_t> out(size);z_stream stream{};
+        if(size>kMaxBlockSize)throw std::runtime_error("Packfile entry too large");
+        // One spare byte lets zlib consume the trailer after the expected output.
+        std::vector<uint8_t> out(size_t(size)+1);
+        z_stream stream{};
         if(inflateInit(&stream)!=Z_OK)throw std::runtime_error("Cannot initialize decompressor");
-        stream.next_in=const_cast<Bytef*>(data.data());stream.avail_in=static_cast<uInt>(data.size());stream.next_out=out.data();stream.avail_out=size;
-        inflate(&stream,Z_FINISH);const auto produced=stream.total_out;inflateEnd(&stream);
-        if(produced!=size)throw std::runtime_error("Cannot decompress packfile entry");return out;
+        stream.next_in=const_cast<Bytef*>(data.data());
+        stream.avail_in=static_cast<uInt>(data.size());
+        stream.next_out=out.data();
+        stream.avail_out=static_cast<uInt>(out.size());
+        const auto result=inflate(&stream,Z_FINISH);
+        const auto produced=stream.total_out,consumed=stream.total_in;
+        const auto ended=inflateEnd(&stream);
+        // SR1 scripts use Z_SYNC_FLUSH blocks, with no final zlib checksum trailer.
+        const bool flushed=result==Z_BUF_ERROR&&data.size()>=4&&Be(data,data.size()-4)==0x0000FFFF;
+        if(ended!=Z_OK||(result!=Z_STREAM_END&&!flushed)||consumed!=data.size()||produced!=size)
+            throw std::runtime_error("Cannot decompress packfile entry");
+        out.resize(size);
+        return out;
     }
 public:
     explicit Pack(const std::filesystem::path& p):path(p){
@@ -83,8 +106,8 @@ public:
         if(Be(h,0)!=0x51890ACE||Be(h,4)!=3)throw std::runtime_error("Unsupported packfile format");
         flags=Be(h,0x14C);auto count=Be(h,0x154),directory=Be(h,0x15C),names_size=Be(h,0x160);
         if(count>100000||uint64_t(count)*28>directory||names_size>16*1024*1024)throw std::runtime_error("Invalid packfile directory");
-        auto names_at=Align(0x800+directory);data_at=Align(names_at+names_size);blob_size=Be(h,0x164);stored_size=Be(h,0x168);
-        auto records=ReadAt(in,0x800,count*28),names=ReadAt(in,names_at,names_size);uint32_t stored=data_at;
+        auto names_at=Align(uint64_t(0x800)+directory);data_at=Align(names_at+names_size);blob_size=Be(h,0x164);stored_size=Be(h,0x168);
+        auto records=ReadAt(in,0x800,count*28),names=ReadAt(in,names_at,names_size);uint64_t stored=data_at;
         for(uint32_t i=0;i<count;++i){auto at=Be(records,i*28);if(at>=names.size())throw std::runtime_error("Invalid packfile name");
             auto end=at;while(end<names.size()&&names[end])++end;if(end==names.size())throw std::runtime_error("Unterminated packfile name");
             entries.push_back({std::string(reinterpret_cast<char*>(names.data()+at),end-at),(flags&2)?Be(records,i*28+8):((flags&1)?stored:data_at+Be(records,i*28+8)),Be(records,i*28+16),Be(records,i*28+20)});
