@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.1
 
 - Release selector input when the panel is hidden or the map is closing.
 - Keep badge corners inside the minimap.

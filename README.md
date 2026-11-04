@@ -19,7 +19,7 @@ The mod reads locations from your own game files. It does not collect items, cha
 
 ## Install
 
-1. Download `SaintsReborn-Collectibles-v0.3.0.zip` from [Releases](https://github.com/kxrxh/SaintsReborn-Collectibles/releases/latest).
+1. Download `SaintsReborn-Collectibles-v0.3.1.zip` from [Releases](https://github.com/kxrxh/SaintsReborn-Collectibles/releases/latest).
 2. Close the game.
 3. Extract the `CollectiblesTracker` folder into `SaintsReborn/dist/mods/`.
 4. Open **Whompay's Mod Loader**, enable **Collectibles Tracker** and press **Play**.
